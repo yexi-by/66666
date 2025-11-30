@@ -1,0 +1,8 @@
+{
+  "display_name": "SD Image Generator",
+  "author": "YourName",
+  "version": "1.0.0",
+  "loading_order": 1,
+  "js": "index.js",
+  "css": "" 
+}
