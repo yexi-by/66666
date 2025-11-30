@@ -1,34 +1,33 @@
 jQuery(async () => {
     // ==========================================
-    // 1. 初始化与设置管理 (Settings & Init)
+    // 1. 初始化变量
     // ==========================================
-    const extensionName = "sd_image_gen"; // 唯一的插件ID，用于存储设置
+    const extensionName = "sd_image_gen"; 
+    const extensionSettingsDivId = "sd_gen_settings"; // 给我们的设置块起个ID，防止重复
     const { eventSource, eventTypes, getContext, saveSettingsDebounced } = SillyTavern;
     
     // 默认设置
     const defaultSettings = {
         apiKey: "",
-        apiUrl: "https://sd.exacg.cc/api/v1/generate_image" // 允许用户也可以改 URL
+        apiUrl: "https://sd.exacg.cc/api/v1/generate_image"
     };
 
-    // 加载设置：如果全局设置里没有，就用默认的
-    let settings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
-
-    // 更新并保存设置的辅助函数
-    function updateSettings() {
-        extension_settings[extensionName] = settings;
-        // 调用酒馆内置的保存函数 (防抖保存，防止频繁读写)
-        saveSettingsDebounced();
-    }
-
     // ==========================================
-    // 2. 构建 UI 界面 (Inject UI)
+    // 2. 稳健的 UI 渲染逻辑 (修复不显示的问题)
     // ==========================================
     function renderExtensionUI() {
-        // 定义设置面板的 HTML
-        // 使用了酒馆原生的 CSS 类名 (inline-drawer, text_pole 等) 保持风格一致
+        // 检查点 1: 酒馆的扩展设置主容器是否存在？如果还没加载出来，就跳过
+        if ($('#extensions_settings').length === 0) return;
+
+        // 检查点 2: 我们的设置界面是不是已经画好了？如果有了，就别再画了
+        if ($(`#${extensionSettingsDivId}`).length > 0) return;
+
+        // 获取当前设置
+        let settings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
+
+        // 定义 HTML
         const settingsHtml = `
-        <div id="sd_gen_settings" class="inline-drawer">
+        <div id="${extensionSettingsDivId}" class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
                 <b>SD 绘图插件设置</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
@@ -45,60 +44,67 @@ jQuery(async () => {
                     <label>API Endpoint</label>
                     <input id="sd_input_url" class="text_pole" type="text" value="${settings.apiUrl}" />
                 </div>
-                
-                <div style="margin-top:10px; opacity:0.7; font-size:0.8em;">
-                    设置会自动保存。
-                </div>
             </div>
         </div>
         `;
 
-        // 将 HTML 插入到酒馆的扩展设置区域
-        // 注意：酒馆的扩展设置容器 ID 通常是 #extensions_settings
+        // 插入 HTML
         $('#extensions_settings').append(settingsHtml);
 
-        // 绑定折叠/展开点击事件
-        $('#sd_gen_settings .inline-drawer-header').on('click', function() {
+        // 重新绑定事件 (因为是新生成的 DOM)
+        // 1. 折叠/展开
+        $(`#${extensionSettingsDivId} .inline-drawer-header`).on('click', function() {
             const content = $(this).next('.inline-drawer-content');
             const icon = $(this).find('.inline-drawer-icon');
             content.slideToggle();
-            icon.toggleClass('down').toggleClass('up'); // 切换箭头方向
+            icon.toggleClass('down').toggleClass('up');
         });
 
-        // 绑定输入框变化事件 (自动保存)
+        // 2. 监听输入保存
         $('#sd_input_apikey').on('input', function() {
-            settings.apiKey = $(this).val().trim();
-            updateSettings();
+            const currentSettings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
+            currentSettings.apiKey = $(this).val().trim();
+            extension_settings[extensionName] = currentSettings;
+            saveSettingsDebounced();
         });
 
         $('#sd_input_url').on('input', function() {
-            settings.apiUrl = $(this).val().trim();
-            updateSettings();
+            const currentSettings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
+            currentSettings.apiUrl = $(this).val().trim();
+            extension_settings[extensionName] = currentSettings;
+            saveSettingsDebounced();
         });
+        
+        console.log("SD插件设置界面注入成功！");
     }
 
+    // 【关键修改】：不再只运行一次，而是每2秒检查一次
+    // 这样能确保无论什么时候加载，设置界面都会出现
+    setInterval(renderExtensionUI, 2000);
+
+
     // ==========================================
-    // 3. 核心业务逻辑 (Core Logic)
+    // 3. 核心业务逻辑 (保持不变)
     // ==========================================
-    
     function extractTargetText(text) {
         const match = text.match(/<image>([\s\S]*?)<\/image>/);
         return match ? match[1].trim() : null;
     }
 
     async function sendDataToServer(content) {
-        // 【关键点】这里直接使用 settings.apiUrl 和 settings.apiKey
-        if (!settings.apiKey) {
+        // 每次发送时实时读取最新设置
+        const currentSettings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
+
+        if (!currentSettings.apiKey) {
             toastr.warning("请先在扩展设置中填写 API Key");
             return null;
         }
 
         try {
-            const response = await fetch(settings.apiUrl, {
+            const response = await fetch(currentSettings.apiUrl, {
                 method: "POST",
                 headers: { 
-                    // 动态调用 Key
-                    "Authorization": `Bearer ${settings.apiKey}`,
+                    "Authorization": `Bearer ${currentSettings.apiKey}`,
                     "Content-Type": "application/json" 
                 },
                 body: JSON.stringify({ prompt: content })
@@ -115,7 +121,7 @@ jQuery(async () => {
             }
         } catch (error) {
             console.error("Network Error:", error);
-            toastr.error("网络请求错误，请检查控制台");
+            toastr.error("网络请求错误");
             return null;
         }
     }
@@ -150,10 +156,8 @@ jQuery(async () => {
     }
 
     // ==========================================
-    // 4. 监听与启动 (Listeners)
+    // 4. 监听消息
     // ==========================================
-
-    // 监听消息接收
     eventSource.on(eventTypes.MESSAGE_RECEIVED, (data) => {
         const context = getContext();
         const messageId = typeof data === 'number' ? data : (context.chat.length - 1);
@@ -172,7 +176,5 @@ jQuery(async () => {
         }
     });
 
-    // 插件加载完成时渲染 UI
-    renderExtensionUI();
-    console.log("SD 绘图插件 (带设置界面版) 已加载");
+    console.log("SD 绘图插件（稳健版）已加载");
 });
