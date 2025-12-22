@@ -1,8 +1,12 @@
 {
-  "display_name": "SD Image Generator",
-  "author": "YourName",
-  "version": "1.0.0",
-  "loading_order": 1,
-  "js": "index.js",
-  "css": "style.css" 
+    "display_name": "WebSocket 消息拦截器",
+    "loading_order": 9,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "SillyTavern User",
+    "version": "1.0.0",
+    "homePage": "https://github.com/SillyTavern/SillyTavern",
+    "description": "在发送消息给AI之前，通过WebSocket与服务端通信处理用户输入"
 }

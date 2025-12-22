@@ -1,170 +1,340 @@
-jQuery(async () => {
-    // ===========================
-    // 配置部分
-    // ===========================
-    const extensionName = "sd_image_gen";
-    const settingsDivId = "sd_gen_settings";
-    const { eventSource, eventTypes, getContext, saveSettingsDebounced } = SillyTavern;
+// SillyTavern WebSocket 消息拦截扩展
+// 在发送消息给AI之前，先通过WebSocket与服务端通信
 
-    // 默认设置
-    const defaultSettings = {
-        apiKey: "",
-        apiUrl: "https://sd.exacg.cc/api/v1/generate_image"
-    };
+import { extension_settings, getContext, loadExtensionSettings } from "../../../extensions.js";
+import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
 
-    // ===========================
-    // 功能函数：注入设置界面
-    // ===========================
-    function injectSettingsUI() {
-        // 1. 如果设置界面已经存在，直接退出，防止重复注入
-        if ($(`#${settingsDivId}`).length > 0) return;
+// 扩展基本信息
+const extensionName = "st-extension-example";
+const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
-        // 2. 找到扩展设置的容器 (酒馆标准ID: #extensions_settings)
-        const $settingsContainer = $('#extensions_settings');
-        if ($settingsContainer.length === 0) return; // 容器还不存在，跳过
+// 默认设置
+const defaultSettings = {
+    enabled: true,
+    wsServerHost: "localhost",
+    wsServerPort: 8080,
+    timeout: 30000, // 超时时间(毫秒)
+};
 
-        // 3. 读取当前配置
-        let settings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
+// WebSocket 连接实例
+let wsConnection = null;
+let isWaitingForResponse = false;
 
-        // 4. 构建 HTML (样式已分离到 style.css)
-        const html = `
-            <div id="${settingsDivId}">
-                <div class="inline-drawer-header">
-                    <b>SD 绘图插件设置</b>
-                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                </div>
-                <div class="inline-drawer-content" style="display:none;">
-                    <div class="styled-setting-block">
-                        <label>API Authorization Key</label>
-                        <input id="sd_input_apikey" class="text_pole" type="password" placeholder="sk-..." value="${settings.apiKey || ''}" />
-                    </div>
-                    <div class="styled-setting-block">
-                        <label>API Endpoint</label>
-                        <input id="sd_input_url" class="text_pole" type="text" value="${settings.apiUrl}" />
-                    </div>
-                </div>
-            </div>
-        `;
-
-        // 5. 插入到容器末尾
-        $settingsContainer.append(html);
-
-        // 6. 绑定事件
-        const $drawer = $(`#${settingsDivId}`);
-        
-        // 折叠/展开
-        $drawer.find('.inline-drawer-header').on('click', function() {
-            $(this).next('.inline-drawer-content').slideToggle();
-            $(this).find('.inline-drawer-icon').toggleClass('down up');
-        });
-
-        // 保存设置
-        $drawer.find('#sd_input_apikey').on('input', function() {
-            settings.apiKey = $(this).val().trim();
-            extension_settings[extensionName] = settings;
-            saveSettingsDebounced();
-        });
-
-        $drawer.find('#sd_input_url').on('input', function() {
-            settings.apiUrl = $(this).val().trim();
-            extension_settings[extensionName] = settings;
-            saveSettingsDebounced();
-        });
-        
-        console.log("[SD Plugin] 设置界面注入成功");
+/**
+ * 加载扩展设置
+ */
+async function loadSettings() {
+    extension_settings[extensionName] = extension_settings[extensionName] || {};
+    if (Object.keys(extension_settings[extensionName]).length === 0) {
+        Object.assign(extension_settings[extensionName], defaultSettings);
     }
 
-    // ===========================
-    // 核心逻辑：监听 DOM 变化 (解决不显示的问题)
-    // ===========================
-    
-    // 这里的逻辑是：监听整个 body，一旦发现 #extensions_settings 出现了，就运行注入函数
-    const observer = new MutationObserver((mutations) => {
-        // 检查扩展设置容器是否存在
-        if (document.getElementById('extensions_settings')) {
-            injectSettingsUI();
+    // 兼容旧版设置（如果存在wsServerUrl则解析）
+    if (extension_settings[extensionName].wsServerUrl && !extension_settings[extensionName].wsServerHost) {
+        try {
+            const url = new URL(extension_settings[extensionName].wsServerUrl);
+            extension_settings[extensionName].wsServerHost = url.hostname;
+            extension_settings[extensionName].wsServerPort = parseInt(url.port) || 8080;
+        } catch (e) {
+            extension_settings[extensionName].wsServerHost = defaultSettings.wsServerHost;
+            extension_settings[extensionName].wsServerPort = defaultSettings.wsServerPort;
         }
-    });
-
-    // 开始观察 DOM 变化
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    // 为了保险，脚本加载时也尝试运行一次
-    injectSettingsUI();
-
-
-    // ===========================
-    // 业务逻辑：提取与生成
-    // ===========================
-    function extractTargetText(text) {
-        const match = text.match(/<image>([\s\S]*?)<\/image>/);
-        return match ? match[1].trim() : null;
     }
 
-    async function sendDataToServer(content) {
-        // 实时读取设置
-        const settings = Object.assign({}, defaultSettings, extension_settings[extensionName]);
-        
-        if (!settings.apiKey) {
-            toastr.warning("请在扩展设置中填写 API Key");
-            return null;
-        }
+    // 更新UI显示
+    $("#ws_interceptor_enabled").prop("checked", extension_settings[extensionName].enabled);
+    $("#ws_server_host").val(extension_settings[extensionName].wsServerHost);
+    $("#ws_server_port").val(extension_settings[extensionName].wsServerPort);
+    $("#ws_timeout").val(extension_settings[extensionName].timeout / 1000);
+}
+
+/**
+ * 获取当前设置
+ */
+/**
+ * 获取当前设置
+ */
+function getSettings() {
+    return extension_settings[extensionName];
+}
+
+/**
+ * 获取完整的WebSocket URL
+ */
+function getWsUrl() {
+    const settings = getSettings();
+    return `ws://${settings.wsServerHost}:${settings.wsServerPort}`;
+}
+
+/**
+ * 创建WebSocket连接并发送消息
+ * @param {string} userInput 用户输入的消息
+ * @returns {Promise<string>} 服务端返回的处理后的消息
+ */
+function sendToWebSocket(userInput) {
+    return new Promise((resolve, reject) => {
+        const settings = getSettings();
+        const wsUrl = getWsUrl();
+        const timeout = settings.timeout;
+
+        console.log(`[WS Interceptor] 正在连接到 WebSocket 服务器: ${wsUrl}`);
 
         try {
-            const response = await fetch(settings.apiUrl, {
-                method: "POST",
-                headers: { 
-                    "Authorization": `Bearer ${settings.apiKey}`,
-                    "Content-Type": "application/json" 
-                },
-                body: JSON.stringify({ prompt: content })
-            });
+            wsConnection = new WebSocket(wsUrl);
 
-            const res = await response.json();
-            if (res.success && res.data && res.data.image_url) {
-                return res.data.image_url;
-            } else {
-                toastr.error("生成失败: " + (res.message || "未知错误"));
-                return null;
-            }
-        } catch (e) {
-            toastr.error("网络请求错误");
-            return null;
-        }
-    }
+            // 设置超时定时器
+            const timeoutId = setTimeout(() => {
+                if (wsConnection && wsConnection.readyState !== WebSocket.CLOSED) {
+                    wsConnection.close();
+                }
+                reject(new Error(`WebSocket 连接超时 (${timeout / 1000}秒)`));
+            }, timeout);
 
-    // 监听消息并生成按钮
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, (data) => {
-        const context = getContext();
-        const msgId = typeof data === 'number' ? data : (context.chat.length - 1);
-        const msg = context.chat[msgId];
+            wsConnection.onopen = () => {
+                console.log("[WS Interceptor] WebSocket 连接已建立");
+                // 发送用户输入到服务端
+                const message = JSON.stringify({
+                    type: "user_input",
+                    content: userInput,
+                    timestamp: Date.now()
+                });
+                wsConnection.send(message);
+                console.log("[WS Interceptor] 已发送消息到服务端:", userInput);
+                
+                // 弹窗通知：消息已发送
+                toastr.info(
+                    `消息已发送到服务端\n内容: ${userInput.substring(0, 50)}${userInput.length > 50 ? '...' : ''}`,
+                    "📤 发送消息",
+                    { timeOut: 3000, extendedTimeOut: 2000 }
+                );
+            };
 
-        if (msg && !msg.is_user) {
-            const extracted = extractTargetText(msg.mes);
-            if (extracted) {
-                // 等待 UI 渲染
-                setTimeout(() => {
-                    const $div = $(`.mes[mesid="${msgId}"] .mes_text`);
-                    if ($div.length && $div.find('.st-gen-img-btn').length === 0) {
-                        const $btn = $(`<button class="st-gen-img-btn">生成图片</button>`);
-                        
-                        $btn.on('click', async function() {
-                            const $me = $(this);
-                            $me.prop('disabled', true).text("正在绘图中...");
-                            const url = await sendDataToServer(extracted);
-                            if (url) {
-                                $me.replaceWith(`<img src="${url}" class="st-generated-image" />`);
-                            } else {
-                                $me.prop('disabled', false).text("生成失败，重试");
-                            }
-                        });
-                        
-                        $div.append($btn);
-                    }
-                }, 100);
-            }
+            wsConnection.onmessage = (event) => {
+                clearTimeout(timeoutId);
+                console.log("[WS Interceptor] 收到服务端响应:", event.data);
+                
+                let processedContent;
+                try {
+                    // 尝试解析JSON响应
+                    const response = JSON.parse(event.data);
+                    processedContent = response.content || response.text || response.message || event.data;
+                } catch (e) {
+                    // 如果不是JSON，直接使用原始文本
+                    processedContent = event.data;
+                }
+                
+                // 弹窗通知：收到响应
+                toastr.success(
+                    `服务端返回内容:\n${processedContent.substring(0, 100)}${processedContent.length > 100 ? '...' : ''}`,
+                    "📥 收到响应",
+                    { timeOut: 5000, extendedTimeOut: 3000 }
+                );
+                
+                // 关闭连接
+                wsConnection.close();
+                resolve(processedContent);
+            };
+
+            wsConnection.onerror = (error) => {
+                clearTimeout(timeoutId);
+                console.error("[WS Interceptor] WebSocket 错误:", error);
+                reject(new Error("WebSocket 连接错误"));
+            };
+
+            wsConnection.onclose = (event) => {
+                console.log("[WS Interceptor] WebSocket 连接已关闭", event.code, event.reason);
+            };
+
+        } catch (error) {
+            reject(new Error(`无法创建 WebSocket 连接: ${error.message}`));
         }
     });
+}
 
-    console.log("[SD Plugin] 插件已加载");
+/**
+ * 拦截用户消息并通过WebSocket处理
+ * @param {string} userMessage 原始用户消息
+ * @returns {Promise<string>} 处理后的消息
+ */
+async function interceptMessage(userMessage) {
+    const settings = getSettings();
+    
+    if (!settings.enabled) {
+        console.log("[WS Interceptor] 扩展已禁用，直接发送原始消息");
+        return userMessage;
+    }
+
+    if (isWaitingForResponse) {
+        console.log("[WS Interceptor] 正在等待上一个请求的响应");
+        toastr.warning("请等待上一个请求完成");
+        return null; // 返回null表示取消发送
+    }
+
+    try {
+        isWaitingForResponse = true;
+        const wsUrl = getWsUrl();
+        toastr.info(
+            `正在连接到 ${wsUrl}...`,
+            "🔌 WebSocket 连接中",
+            { timeOut: 2000 }
+        );
+        
+        // 发送到WebSocket服务端并等待响应
+        const processedMessage = await sendToWebSocket(userMessage);
+        
+        console.log("[WS Interceptor] 处理后的消息:", processedMessage);
+        toastr.success(
+            "消息处理完成，正在发送给 AI",
+            "✅ 处理完成",
+            { timeOut: 3000 }
+        );
+        
+        return processedMessage;
+    } catch (error) {
+        console.error("[WS Interceptor] 处理消息时出错:", error);
+        toastr.error(`处理失败: ${error.message}`, "WS Interceptor");
+        // 出错时返回原始消息，让用户决定是否继续
+        return userMessage;
+    } finally {
+        isWaitingForResponse = false;
+    }
+}
+
+/**
+ * 消息发送前的事件处理器
+ */
+async function onMessageSendBefore(data) {
+    const settings = getSettings();
+    
+    if (!settings.enabled) {
+        return;
+    }
+
+    // 获取用户输入
+    const userMessage = data.message;
+    
+    if (!userMessage || userMessage.trim() === "") {
+        return;
+    }
+
+    console.log("[WS Interceptor] 拦截到用户消息:", userMessage);
+
+    try {
+        // 处理消息
+        const processedMessage = await interceptMessage(userMessage);
+        
+        if (processedMessage === null) {
+            // 取消发送
+            data.abort = true;
+            return;
+        }
+
+        // 用处理后的消息替换原始消息
+        data.message = processedMessage;
+        console.log("[WS Interceptor] 消息已替换为处理后的内容");
+        
+    } catch (error) {
+        console.error("[WS Interceptor] 处理失败:", error);
+        toastr.error(`WebSocket处理失败: ${error.message}`);
+    }
+}
+
+/**
+ * 启用状态改变处理器
+ */
+function onEnabledChange(event) {
+    const value = Boolean($(event.target).prop("checked"));
+    extension_settings[extensionName].enabled = value;
+    saveSettingsDebounced();
+    
+    if (value) {
+        toastr.success("WebSocket 拦截器已启用");
+    } else {
+        toastr.info("WebSocket 拦截器已禁用");
+    }
+}
+
+/**
+ * 服务器地址改变处理器
+ */
+function onServerHostChange(event) {
+    const value = $(event.target).val();
+    extension_settings[extensionName].wsServerHost = value;
+    saveSettingsDebounced();
+}
+
+/**
+ * 服务器端口改变处理器
+ */
+function onServerPortChange(event) {
+    const value = parseInt($(event.target).val()) || 8080;
+    extension_settings[extensionName].wsServerPort = value;
+    saveSettingsDebounced();
+}
+
+/**
+ * 超时时间改变处理器
+ */
+function onTimeoutChange(event) {
+    const value = parseInt($(event.target).val()) * 1000;
+    extension_settings[extensionName].timeout = value;
+    saveSettingsDebounced();
+}
+
+/**
+ * 测试WebSocket连接
+ */
+async function onTestConnection() {
+    const wsUrl = getWsUrl();
+    
+    try {
+        toastr.info(`正在测试连接到 ${wsUrl}...`, "🔌 测试连接");
+        
+        const ws = new WebSocket(wsUrl);
+        
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                ws.close();
+                reject(new Error("连接超时"));
+            }, 5000);
+
+            ws.onopen = () => {
+                clearTimeout(timeout);
+                ws.close();
+                resolve();
+            };
+
+            ws.onerror = () => {
+                clearTimeout(timeout);
+                reject(new Error("连接失败"));
+            };
+        });
+
+        toastr.success(`✅ 成功连接到 ${wsUrl}`, "连接测试成功");
+    } catch (error) {
+        toastr.error(`❌ 连接失败: ${error.message}`, "连接测试失败");
+    }
+}
+
+// 扩展初始化
+jQuery(async () => {
+    // 加载设置面板HTML
+    const settingsHtml = await $.get(`${extensionFolderPath}/example.html`);
+    $("#extensions_settings").append(settingsHtml);
+
+    // 绑定事件处理器
+    $("#ws_interceptor_enabled").on("change", onEnabledChange);
+    $("#ws_server_host").on("change", onServerHostChange);
+    $("#ws_server_port").on("change", onServerPortChange);
+    $("#ws_timeout").on("change", onTimeoutChange);
+    $("#ws_test_connection").on("click", onTestConnection);
+
+    // 加载设置
+    await loadSettings();
+
+    // 注册消息发送前的事件监听器
+    // 使用 MESSAGE_SENT 事件来拦截消息
+    eventSource.on(event_types.MESSAGE_SENDING, onMessageSendBefore);
+
+    console.log("[WS Interceptor] 扩展已加载");
 });
