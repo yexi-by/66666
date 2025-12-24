@@ -1,63 +1,7 @@
-/* WebSocket 消息拦截器样式 */
-
-.ws-interceptor-settings {
-    margin-bottom: 10px;
+.ws-prompt-injector_status {
+  padding: 4px 8px;
 }
 
-.ws-interceptor_block {
-    margin: 10px 0;
-}
-
-.ws-interceptor_block label {
-    display: block;
-    margin-bottom: 5px;
-    font-weight: 500;
-}
-
-.ws-interceptor_block input[type="text"],
-.ws-interceptor_block input[type="number"] {
-    width: 100%;
-    box-sizing: border-box;
-}
-
-.ws-interceptor_block.flex-container {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.ws-interceptor_block.flex-container label {
-    display: inline;
-    margin-bottom: 0;
-}
-
-.ws-interceptor_info {
-    background-color: rgba(100, 100, 100, 0.2);
-    padding: 10px;
-    border-radius: 5px;
-    font-size: 0.9em;
-}
-
-.ws-interceptor_info p {
-    margin: 0 0 5px 0;
-}
-
-.ws-interceptor_info ul {
-    margin: 5px 0;
-    padding-left: 20px;
-}
-
-.ws-interceptor_info li {
-    margin: 3px 0;
-}
-
-.ws-interceptor_info code {
-    background-color: rgba(0, 0, 0, 0.3);
-    padding: 2px 5px;
-    border-radius: 3px;
-    font-family: monospace;
-}
-
-#ws_test_connection {
-    margin-top: 5px;
+.ws-prompt-injector_hint {
+  margin-left: 8px;
 }
