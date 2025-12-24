@@ -1,12 +1,10 @@
 {
-    "display_name": "WebSocket 消息拦截器",
-    "loading_order": 9,
-    "requires": [],
-    "optional": [],
-    "js": "index.js",
-    "css": "style.css",
-    "author": "SillyTavern User",
-    "version": "1.0.0",
-    "homePage": "https://github.com/SillyTavern/SillyTavern",
-    "description": "在发送消息给AI之前，通过WebSocket与服务端通信处理用户输入"
+  "display_name": "WS Prompt Injector",
+  "loading_order": 30,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "yexi-by",
+  "version": "1.0.0",
+  "auto_update": false,
+  "generate_interceptor": "wsPromptInjectorInterceptor"
 }

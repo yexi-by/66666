@@ -1,0 +1,33 @@
+<div class="ws-prompt-injector-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>WS Prompt Injector</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+
+        <div class="inline-drawer-content">
+            <div class="ws-prompt-injector_block flex-container">
+                <input id="ws_prompt_injector_enabled" type="checkbox" />
+                <label for="ws_prompt_injector_enabled">启用：生成前把 user_input 发到 WS，并把回包注入到提示词末尾</label>
+            </div>
+
+            <div class="ws-prompt-injector_block flex-container">
+                <label for="ws_prompt_injector_url" style="min-width: 70px;">WS 地址</label>
+                <input id="ws_prompt_injector_url" class="text_pole" type="text" placeholder="ws://127.0.0.1:8765" />
+            </div>
+
+            <div class="ws-prompt-injector_block flex-container">
+                <input id="ws_prompt_injector_connect" class="menu_button" type="submit" value="连接" />
+                <input id="ws_prompt_injector_disconnect" class="menu_button" type="submit" value="断开" />
+                <div id="ws_prompt_injector_status" class="ws-prompt-injector_status"></div>
+            </div>
+
+            <div class="ws-prompt-injector_block flex-container">
+                <input id="ws_prompt_injector_test" class="menu_button" type="submit" value="发送测试" />
+                <span class="ws-prompt-injector_hint">会发送当前输入框内容（或最后一条用户消息）并等待回包</span>
+            </div>
+
+            <hr class="sysHR" />
+        </div>
+    </div>
+</div>
