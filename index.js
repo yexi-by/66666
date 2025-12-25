@@ -4,6 +4,13 @@ const LOG_PREFIX = '[WS Prompt Injector]';
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
     wsUrl: '',
+    // WS 回包注入设置：
+    // - role: system | user | assistant
+    // - offsetFromBottom: 从底部数的偏移量
+    //   0 = 插入到最底部（作为最后一条）
+    //   1 = 插入到倒数第 1 条消息之前
+    injectionRole: 'system',
+    insertionOffsetFromBottom: 0,
 });
 
 /** @type {WebSocket | null} */
@@ -12,6 +19,45 @@ let ws = null;
 let wsUrlActive = null;
 /** @type {Map<string, {resolve: (v: string) => void, reject: (e: any) => void, timeoutId: number}>} */
 const pendingRequests = new Map();
+
+/** @type {Set<string>} */
+const ephemeralIds = new Set();
+
+function isEphemeralMessage(m) {
+    return Boolean(m && typeof m === 'object' && typeof m.__ws_prompt_injector_ephemeral_id === 'string');
+}
+
+function cleanupEphemeralMessages() {
+    if (ephemeralIds.size === 0) return 0;
+    let removed = 0;
+    try {
+        const ctx = getContextSafe();
+        const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const m = chat[i];
+            const id = m?.__ws_prompt_injector_ephemeral_id;
+            if (typeof id === 'string' && ephemeralIds.has(id)) {
+                chat.splice(i, 1);
+                ephemeralIds.delete(id);
+                removed++;
+            }
+        }
+    } catch (err) {
+        logWarn('清理临时注入消息失败（可忽略）：', err);
+    }
+    return removed;
+}
+
+function coerceInsertionRole(role) {
+    if (role === 'system' || role === 'user' || role === 'assistant') return role;
+    return 'system';
+}
+
+function clampInt(value, { min, max, fallback }) {
+    const n = Number.parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
 
 function getContextSafe() {
     if (typeof SillyTavern === 'undefined' || typeof SillyTavern.getContext !== 'function') {
@@ -97,12 +143,15 @@ function parseWsPayload(raw) {
     // 1) 纯文本：直接作为注入文本
     // 2) JSON：{ requestId, text } 或 { requestId, injection } 或 { text } ...
     if (typeof raw !== 'string') return { requestId: null, text: '' };
-    const trimmed = raw.trim();
-    if (!trimmed) return { requestId: null, text: '' };
 
-    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    // 仅检测“是否为空”，严禁修改文本内容（包括空格/换行）。
+    if (raw.length === 0) return { requestId: null, text: '' };
+
+    // JSON 检测仅用于解析分发 requestId，不影响返回 text 的原始性。
+    const maybeJson = raw.trimStart();
+    if (maybeJson.startsWith('{') && maybeJson.trimEnd().endsWith('}')) {
         try {
-            const obj = JSON.parse(trimmed);
+            const obj = JSON.parse(raw);
             const requestId = typeof obj.requestId === 'string' ? obj.requestId : null;
             const text =
                 typeof obj.injection === 'string'
@@ -117,7 +166,7 @@ function parseWsPayload(raw) {
             // JSON 解析失败则按纯文本处理
         }
     }
-    return { requestId: null, text: trimmed };
+    return { requestId: null, text: raw };
 }
 
 async function connectWs(wsUrl) {
@@ -258,11 +307,57 @@ async function requestInjectionOverWs(userInput, { type } = {}) {
 function findLastUserMessage(chat) {
     for (let i = chat.length - 1; i >= 0; i--) {
         const m = chat[i];
+        if (isEphemeralMessage(m)) continue;
         if (m && typeof m === 'object' && m.is_user === true && typeof m.mes === 'string') {
             return { index: i, message: m };
         }
     }
     return null;
+}
+
+function findLastAssistantMessage(chat) {
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (isEphemeralMessage(m)) continue;
+        if (m && typeof m === 'object' && m.is_user === false && typeof m.mes === 'string') {
+            return { index: i, message: m };
+        }
+    }
+    return null;
+}
+
+function buildEphemeralMessage({ role, content, chat }) {
+    const now = Date.now();
+    const id = `${now}_${Math.random().toString(16).slice(2)}`;
+
+    /** @type {{is_user: boolean, name: string, send_date: number, mes: string, __ws_prompt_injector_ephemeral_id: string}} */
+    const m = {
+        is_user: role === 'user',
+        name: role === 'system' ? 'system' : role,
+        send_date: now,
+        mes: content,
+        __ws_prompt_injector_ephemeral_id: id,
+    };
+
+    // 尽量沿用当前聊天里已有的 name，避免某些格式器依赖 name。
+    if (role === 'user') {
+        const lastUser = findLastUserMessage(chat);
+        if (lastUser?.message?.name) m.name = lastUser.message.name;
+    }
+    if (role === 'assistant') {
+        const lastAsst = findLastAssistantMessage(chat);
+        if (lastAsst?.message?.name) m.name = lastAsst.message.name;
+    }
+
+    ephemeralIds.add(id);
+    return m;
+}
+
+function insertEphemeralMessage(chat, message, offsetFromBottom) {
+    const offset = clampInt(offsetFromBottom, { min: 0, max: chat.length, fallback: 0 });
+    const index = Math.max(0, Math.min(chat.length, chat.length - offset));
+    chat.splice(index, 0, message);
+    return index;
 }
 
 async function waitForElement(selector, timeoutMs) {
@@ -289,6 +384,9 @@ globalThis.wsPromptInjectorInterceptor = async function (chat, contextSize, abor
             logWarn('拦截器跳过：WS 地址为空');
             return;
         }
+
+        // 先清理可能残留的临时注入（例如异常中断未走到清理逻辑）
+        cleanupEphemeralMessages();
 
         const lastUser = findLastUserMessage(chat);
         if (!lastUser) {
@@ -323,19 +421,24 @@ globalThis.wsPromptInjectorInterceptor = async function (chat, contextSize, abor
             return;
         }
 
-        // 你已保证服务端回包格式正确：这里原样保留（不 trim），避免误删有效空白/换行
-        const clean = typeof injection === 'string' ? injection : String(injection ?? '');
-        if (clean.length === 0) {
+        // 仅检测空字符串；若不为空，严禁对文本做任何修改（包括 trim/换行拼接）。
+        const wsText = typeof injection === 'string' ? injection : String(injection ?? '');
+        if (wsText.length === 0) {
             logWarn('WS 回包为空字符串：跳过注入');
             return;
         }
 
-        // 重要：按文档建议 clone 被修改的 message，避免把注入写进真实聊天记录
-        const cloned = structuredClone(lastUser.message);
-        cloned.mes = `${cloned.mes}\n\n${clean}`;
-        chat[lastUser.index] = cloned;
+        // 将 WS 回包作为“临时楼层”插入到指定位置（从下往上偏移），并在生成结束后清理。
+        const role = coerceInsertionRole(settings.injectionRole);
+        const ephemeralMessage = buildEphemeralMessage({ role, content: wsText, chat });
+        const insertedAt = insertEphemeralMessage(chat, ephemeralMessage, settings.insertionOffsetFromBottom);
 
-        logInfo('已注入到提示词末尾：', { injectedChars: clean.length });
+        logInfo('已插入临时注入消息：', {
+            role,
+            insertedAt,
+            injectedChars: wsText.length,
+            offsetFromBottom: settings.insertionOffsetFromBottom,
+        });
     } catch (err) {
         const msg = `拦截器异常：${friendlyError(err)}（将不注入，继续正常生成）`;
         if (typeof toastr !== 'undefined') toastr.error(msg, 'WS Prompt Injector');
@@ -345,7 +448,7 @@ globalThis.wsPromptInjectorInterceptor = async function (chat, contextSize, abor
 };
 
 async function initUi() {
-    const { saveSettingsDebounced, Popup } = getContextSafe();
+    const { saveSettingsDebounced, Popup, eventSource, event_types } = getContextSafe();
     const settings = getSettings();
 
     // Linux/Docker 等环境下，使用 import.meta.url + $.get 可能因为加载方式不同而失败。
@@ -380,6 +483,21 @@ async function initUi() {
                 <span class="ws-prompt-injector_hint">会发送当前输入框内容（或最后一条用户消息）并等待回包</span>
             </div>
 
+            <div class="ws-prompt-injector_block flex-container">
+                <label for="ws_prompt_injector_role" style="min-width: 70px;">插入角色</label>
+                <select id="ws_prompt_injector_role" class="text_pole">
+                    <option value="system">system</option>
+                    <option value="user">user</option>
+                    <option value="assistant">assistant</option>
+                </select>
+            </div>
+
+            <div class="ws-prompt-injector_block flex-container">
+                <label for="ws_prompt_injector_offset" style="min-width: 70px;">插入位置</label>
+                <input id="ws_prompt_injector_offset" class="text_pole" type="number" min="0" step="1" />
+                <span class="ws-prompt-injector_hint">从底部偏移：0=最底部(最后一条)，1=倒数第1条之前</span>
+            </div>
+
             <hr class="sysHR" />
         </div>
     </div>
@@ -398,6 +516,8 @@ async function initUi() {
     // 初始化控件值
     jQuery('#ws_prompt_injector_enabled').prop('checked', Boolean(settings.enabled)).trigger('input');
     jQuery('#ws_prompt_injector_url').val(settings.wsUrl ?? '');
+    jQuery('#ws_prompt_injector_role').val(coerceInsertionRole(settings.injectionRole));
+    jQuery('#ws_prompt_injector_offset').val(String(clampInt(settings.insertionOffsetFromBottom, { min: 0, max: 9999, fallback: 0 })));
 
     function persist() {
         saveSettingsDebounced();
@@ -413,6 +533,18 @@ async function initUi() {
     jQuery('#ws_prompt_injector_url').on('input', (ev) => {
         settings.wsUrl = String(jQuery(ev.target).val() ?? '').trim();
         logInfo('设置变更：wsUrl=', settings.wsUrl);
+        persist();
+    });
+
+    jQuery('#ws_prompt_injector_role').on('change', (ev) => {
+        settings.injectionRole = coerceInsertionRole(String(jQuery(ev.target).val() ?? 'system'));
+        logInfo('设置变更：injectionRole=', settings.injectionRole);
+        persist();
+    });
+
+    jQuery('#ws_prompt_injector_offset').on('input', (ev) => {
+        settings.insertionOffsetFromBottom = clampInt(jQuery(ev.target).val(), { min: 0, max: 9999, fallback: 0 });
+        logInfo('设置变更：insertionOffsetFromBottom=', settings.insertionOffsetFromBottom);
         persist();
     });
 
@@ -484,6 +616,18 @@ async function initUi() {
     updateStatusUi();
     logInfo('扩展 UI 初始化完成');
 
+    // 生成完成/停止后，立即清理临时注入内容，确保不计入后续上下文。
+    if (eventSource && event_types) {
+        const tryCleanup = (reason) => {
+            const removed = cleanupEphemeralMessages();
+            if (removed > 0) logDebug(`已清理临时注入消息：reason=${reason}`, { removed });
+        };
+        eventSource.on(event_types.MESSAGE_RECEIVED, () => tryCleanup('MESSAGE_RECEIVED'));
+        eventSource.on(event_types.GENERATION_ENDED, () => tryCleanup('GENERATION_ENDED'));
+        eventSource.on(event_types.GENERATION_STOPPED, () => tryCleanup('GENERATION_STOPPED'));
+        eventSource.on(event_types.CHAT_CHANGED, () => tryCleanup('CHAT_CHANGED'));
+    }
+
     // 启用时尝试自动连接（失败不弹阻断性弹窗）
     if (settings.enabled && settings.wsUrl) {
         connectWs(settings.wsUrl).catch((err) => {
@@ -501,344 +645,4 @@ jQuery(async () => {
         if (typeof toastr !== 'undefined') toastr.error(msg, 'WS Prompt Injector');
         logError(msg, err);
     }
-});
-// SillyTavern WebSocket 消息拦截扩展
-// 在发送消息给AI之前，先通过WebSocket与服务端通信
-
-import { extension_settings, getContext, loadExtensionSettings } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
-
-// 扩展基本信息
-const extensionName = "st-extension-example";
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
-
-// 默认设置
-const defaultSettings = {
-    enabled: true,
-    wsServerHost: "localhost",
-    wsServerPort: 8080,
-    timeout: 30000, // 超时时间(毫秒)
-};
-
-// WebSocket 连接实例
-let wsConnection = null;
-let isWaitingForResponse = false;
-
-/**
- * 加载扩展设置
- */
-async function loadSettings() {
-    extension_settings[extensionName] = extension_settings[extensionName] || {};
-    if (Object.keys(extension_settings[extensionName]).length === 0) {
-        Object.assign(extension_settings[extensionName], defaultSettings);
-    }
-
-    // 兼容旧版设置（如果存在wsServerUrl则解析）
-    if (extension_settings[extensionName].wsServerUrl && !extension_settings[extensionName].wsServerHost) {
-        try {
-            const url = new URL(extension_settings[extensionName].wsServerUrl);
-            extension_settings[extensionName].wsServerHost = url.hostname;
-            extension_settings[extensionName].wsServerPort = parseInt(url.port) || 8080;
-        } catch (e) {
-            extension_settings[extensionName].wsServerHost = defaultSettings.wsServerHost;
-            extension_settings[extensionName].wsServerPort = defaultSettings.wsServerPort;
-        }
-    }
-
-    // 更新UI显示
-    $("#ws_interceptor_enabled").prop("checked", extension_settings[extensionName].enabled);
-    $("#ws_server_host").val(extension_settings[extensionName].wsServerHost);
-    $("#ws_server_port").val(extension_settings[extensionName].wsServerPort);
-    $("#ws_timeout").val(extension_settings[extensionName].timeout / 1000);
-}
-
-/**
- * 获取当前设置
- */
-/**
- * 获取当前设置
- */
-function getSettings() {
-    return extension_settings[extensionName];
-}
-
-/**
- * 获取完整的WebSocket URL
- */
-function getWsUrl() {
-    const settings = getSettings();
-    return `ws://${settings.wsServerHost}:${settings.wsServerPort}`;
-}
-
-/**
- * 创建WebSocket连接并发送消息
- * @param {string} userInput 用户输入的消息
- * @returns {Promise<string>} 服务端返回的处理后的消息
- */
-function sendToWebSocket(userInput) {
-    return new Promise((resolve, reject) => {
-        const settings = getSettings();
-        const wsUrl = getWsUrl();
-        const timeout = settings.timeout;
-
-        console.log(`[WS Interceptor] 正在连接到 WebSocket 服务器: ${wsUrl}`);
-
-        try {
-            wsConnection = new WebSocket(wsUrl);
-
-            // 设置超时定时器
-            const timeoutId = setTimeout(() => {
-                if (wsConnection && wsConnection.readyState !== WebSocket.CLOSED) {
-                    wsConnection.close();
-                }
-                reject(new Error(`WebSocket 连接超时 (${timeout / 1000}秒)`));
-            }, timeout);
-
-            wsConnection.onopen = () => {
-                console.log("[WS Interceptor] WebSocket 连接已建立");
-                // 发送用户输入到服务端
-                const message = JSON.stringify({
-                    type: "user_input",
-                    content: userInput,
-                    timestamp: Date.now()
-                });
-                wsConnection.send(message);
-                console.log("[WS Interceptor] 已发送消息到服务端:", userInput);
-                
-                // 弹窗通知：消息已发送
-                toastr.info(
-                    `消息已发送到服务端\n内容: ${userInput.substring(0, 50)}${userInput.length > 50 ? '...' : ''}`,
-                    "📤 发送消息",
-                    { timeOut: 3000, extendedTimeOut: 2000 }
-                );
-            };
-
-            wsConnection.onmessage = (event) => {
-                clearTimeout(timeoutId);
-                console.log("[WS Interceptor] 收到服务端响应:", event.data);
-                
-                let processedContent;
-                try {
-                    // 尝试解析JSON响应
-                    const response = JSON.parse(event.data);
-                    processedContent = response.content || response.text || response.message || event.data;
-                } catch (e) {
-                    // 如果不是JSON，直接使用原始文本
-                    processedContent = event.data;
-                }
-                
-                // 弹窗通知：收到响应
-                toastr.success(
-                    `服务端返回内容:\n${processedContent.substring(0, 100)}${processedContent.length > 100 ? '...' : ''}`,
-                    "📥 收到响应",
-                    { timeOut: 5000, extendedTimeOut: 3000 }
-                );
-                
-                // 关闭连接
-                wsConnection.close();
-                resolve(processedContent);
-            };
-
-            wsConnection.onerror = (error) => {
-                clearTimeout(timeoutId);
-                console.error("[WS Interceptor] WebSocket 错误:", error);
-                reject(new Error("WebSocket 连接错误"));
-            };
-
-            wsConnection.onclose = (event) => {
-                console.log("[WS Interceptor] WebSocket 连接已关闭", event.code, event.reason);
-            };
-
-        } catch (error) {
-            reject(new Error(`无法创建 WebSocket 连接: ${error.message}`));
-        }
-    });
-}
-
-/**
- * 拦截用户消息并通过WebSocket处理
- * @param {string} userMessage 原始用户消息
- * @returns {Promise<string>} 处理后的消息
- */
-async function interceptMessage(userMessage) {
-    const settings = getSettings();
-    
-    if (!settings.enabled) {
-        console.log("[WS Interceptor] 扩展已禁用，直接发送原始消息");
-        return userMessage;
-    }
-
-    if (isWaitingForResponse) {
-        console.log("[WS Interceptor] 正在等待上一个请求的响应");
-        toastr.warning("请等待上一个请求完成");
-        return null; // 返回null表示取消发送
-    }
-
-    try {
-        isWaitingForResponse = true;
-        const wsUrl = getWsUrl();
-        toastr.info(
-            `正在连接到 ${wsUrl}...`,
-            "🔌 WebSocket 连接中",
-            { timeOut: 2000 }
-        );
-        
-        // 发送到WebSocket服务端并等待响应
-        const processedMessage = await sendToWebSocket(userMessage);
-        
-        console.log("[WS Interceptor] 处理后的消息:", processedMessage);
-        toastr.success(
-            "消息处理完成，正在发送给 AI",
-            "✅ 处理完成",
-            { timeOut: 3000 }
-        );
-        
-        return processedMessage;
-    } catch (error) {
-        console.error("[WS Interceptor] 处理消息时出错:", error);
-        toastr.error(`处理失败: ${error.message}`, "WS Interceptor");
-        // 出错时返回原始消息，让用户决定是否继续
-        return userMessage;
-    } finally {
-        isWaitingForResponse = false;
-    }
-}
-
-/**
- * 消息发送前的事件处理器
- */
-async function onMessageSendBefore(data) {
-    const settings = getSettings();
-    
-    if (!settings.enabled) {
-        return;
-    }
-
-    // 获取用户输入
-    const userMessage = data.message;
-    
-    if (!userMessage || userMessage.trim() === "") {
-        return;
-    }
-
-    console.log("[WS Interceptor] 拦截到用户消息:", userMessage);
-
-    try {
-        // 处理消息
-        const processedMessage = await interceptMessage(userMessage);
-        
-        if (processedMessage === null) {
-            // 取消发送
-            data.abort = true;
-            return;
-        }
-
-        // 用处理后的消息替换原始消息
-        data.message = processedMessage;
-        console.log("[WS Interceptor] 消息已替换为处理后的内容");
-        
-    } catch (error) {
-        console.error("[WS Interceptor] 处理失败:", error);
-        toastr.error(`WebSocket处理失败: ${error.message}`);
-    }
-}
-
-/**
- * 启用状态改变处理器
- */
-function onEnabledChange(event) {
-    const value = Boolean($(event.target).prop("checked"));
-    extension_settings[extensionName].enabled = value;
-    saveSettingsDebounced();
-    
-    if (value) {
-        toastr.success("WebSocket 拦截器已启用");
-    } else {
-        toastr.info("WebSocket 拦截器已禁用");
-    }
-}
-
-/**
- * 服务器地址改变处理器
- */
-function onServerHostChange(event) {
-    const value = $(event.target).val();
-    extension_settings[extensionName].wsServerHost = value;
-    saveSettingsDebounced();
-}
-
-/**
- * 服务器端口改变处理器
- */
-function onServerPortChange(event) {
-    const value = parseInt($(event.target).val()) || 8080;
-    extension_settings[extensionName].wsServerPort = value;
-    saveSettingsDebounced();
-}
-
-/**
- * 超时时间改变处理器
- */
-function onTimeoutChange(event) {
-    const value = parseInt($(event.target).val()) * 1000;
-    extension_settings[extensionName].timeout = value;
-    saveSettingsDebounced();
-}
-
-/**
- * 测试WebSocket连接
- */
-async function onTestConnection() {
-    const wsUrl = getWsUrl();
-    
-    try {
-        toastr.info(`正在测试连接到 ${wsUrl}...`, "🔌 测试连接");
-        
-        const ws = new WebSocket(wsUrl);
-        
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                ws.close();
-                reject(new Error("连接超时"));
-            }, 5000);
-
-            ws.onopen = () => {
-                clearTimeout(timeout);
-                ws.close();
-                resolve();
-            };
-
-            ws.onerror = () => {
-                clearTimeout(timeout);
-                reject(new Error("连接失败"));
-            };
-        });
-
-        toastr.success(`✅ 成功连接到 ${wsUrl}`, "连接测试成功");
-    } catch (error) {
-        toastr.error(`❌ 连接失败: ${error.message}`, "连接测试失败");
-    }
-}
-
-// 扩展初始化
-jQuery(async () => {
-    // 加载设置面板HTML
-    const settingsHtml = await $.get(`${extensionFolderPath}/example.html`);
-    $("#extensions_settings").append(settingsHtml);
-
-    // 绑定事件处理器
-    $("#ws_interceptor_enabled").on("change", onEnabledChange);
-    $("#ws_server_host").on("change", onServerHostChange);
-    $("#ws_server_port").on("change", onServerPortChange);
-    $("#ws_timeout").on("change", onTimeoutChange);
-    $("#ws_test_connection").on("click", onTestConnection);
-
-    // 加载设置
-    await loadSettings();
-
-    // 注册消息发送前的事件监听器
-    // 使用 MESSAGE_SENT 事件来拦截消息
-    eventSource.on(event_types.MESSAGE_SENDING, onMessageSendBefore);
-
-    console.log("[WS Interceptor] 扩展已加载");
 });
